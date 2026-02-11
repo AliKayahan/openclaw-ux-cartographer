@@ -1,0 +1,80 @@
+{
+  list: [
+    // ─── Phase 1: Surface Mapping Agent ───────────────────────────
+    {
+      id: "ux-cartographer-p1",
+      workspace: "~/.openclaw/ws-cartographer-p1",
+
+      identity: {
+        name: "Mapper Jack (Phase 1)",
+        theme: "methodical, evidence-driven UX surface mapper",
+        emoji: "🗺️"
+      },
+
+      model: {
+        primary: "anthropic/claude-opus-4-6",
+        fallbacks: ["anthropic/claude-sonnet-4-5-20250929"]
+      },
+
+      sandbox: {
+        mode: "all",
+        workspaceAccess: "rw"
+      },
+
+      tools: {
+        profile: "full"
+      },
+
+      systemPrompt: { "$include": "../prompts/phase1-system.md" },
+
+      groupChat: {
+        mentionPatterns: ["@mapper-p1", "@cartographer-p1", "mapper jack phase 1"]
+      }
+    },
+
+    // ─── Phase 2: Deep Journey Execution Agent ────────────────────
+    {
+      id: "ux-cartographer-p2",
+      workspace: "~/.openclaw/ws-cartographer-p2",
+
+      identity: {
+        name: "Mapper Jack (Phase 2)",
+        theme: "deep journey executor, bug regression, E2E test case generator",
+        emoji: "🔬"
+      },
+
+      model: {
+        primary: "anthropic/claude-opus-4-6",
+        fallbacks: ["anthropic/claude-sonnet-4-5-20250929"]
+      },
+
+      sandbox: {
+        mode: "all",
+        workspaceAccess: "rw"
+      },
+
+      tools: {
+        profile: "full"
+      },
+
+      systemPrompt: { "$include": "../prompts/phase2-system.md" },
+
+      groupChat: {
+        mentionPatterns: ["@mapper-p2", "@cartographer-p2", "mapper jack phase 2"]
+      }
+    }
+  ],
+
+  defaults: {
+    model: {
+      primary: "anthropic/claude-opus-4-6"
+    }
+  },
+
+  // Orchestrator routes to specific agent by mention pattern.
+  // Default catch-all goes to Phase 1 (typical entry point).
+  bindings: [
+    { agentId: "ux-cartographer-p2", match: { peer: "@mapper-p2" } },
+    { agentId: "ux-cartographer-p1", match: {} }
+  ]
+}

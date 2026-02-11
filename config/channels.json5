@@ -1,0 +1,5 @@
+{
+  // Control UI only — zero external channel config needed
+  // The Control UI (web dashboard) is always available at the Gateway port.
+  // No additional channel tokens required for this deployment.
+}

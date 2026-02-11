@@ -1,0 +1,8 @@
+{
+  dmScope: "per-channel-peer",
+
+  resetPolicy: {
+    default: "daily",
+    hour: 4
+  }
+}

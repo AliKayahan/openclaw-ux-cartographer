@@ -1,0 +1,14 @@
+{
+  // OpenClaw Configuration — Deep UX Cartographer Agent
+  // Deploy: copy this folder to ~/.openclaw/ on target machine
+
+  agents:   { "$include": "./config/agents.json5" },
+  channels: { "$include": "./config/channels.json5" },
+  gateway:  { "$include": "./config/gateway.json5" },
+  session:  { "$include": "./config/session.json5" },
+
+  logging: {
+    level: "info",
+    redactSensitive: "tools"
+  }
+}
