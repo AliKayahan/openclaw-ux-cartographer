@@ -61,6 +61,12 @@ informed and prevents it from assuming you are stalled or dead.
     "e2eCasesGenerated": <int>,
     "gatesEncountered": <int>,
     "solverLoopsExecuted": <int>
+  },
+  "contextHealth": {
+    "estimatedTokensUsed": <int>,
+    "budgetPct": <int 0-100>,
+    "budgetPhase": "green | yellow | red | critical",
+    "journeysSinceCheckpoint": <int>
   }
 }
 ```
@@ -90,6 +96,133 @@ informed and prevents it from assuming you are stalled or dead.
 7. **Heartbeat is INLINE**: Emit the heartbeat JSON block within your
    regular message flow. It is not a separate channel — it is part of
    your conversation output that the orchestrator parses.
+
+8. **Progress summary**: Every 5th heartbeat (~5 minutes), include a
+   human-readable summary alongside the JSON:
+
+   ```
+   --- PROGRESS SUMMARY (seq: {N}) ---
+   Time elapsed: {HH:MM}
+   Journeys: {completed}/{total} ({coverage}%)
+   Current: {what you're doing and why}
+   Key findings since last summary: {bullets}
+   Context health: {budget phase} (~{pct}% used)
+   Next: {planned actions}
+   ---
+   ```
+
+9. **Stall escalation**: If you emit 3 consecutive heartbeats with
+   `status: "stalled"` and the same `stalledReason`, you MUST escalate:
+   - Change status to `"stalled_escalated"`.
+   - Include `attemptedRecovery`: list of actions you tried.
+   - Include `evidence`: screenshots or error messages.
+   - Include `recommendation`: "skip" | "retry with hint" | "need help".
+   - The orchestrator will decide your next action.
+
+---
+
+## ════════════════════════════════════════════
+## SESSION BUDGET PROTOCOL
+## ════════════════════════════════════════════
+
+You operate within a ~200k token context window. You MUST track your
+estimated token usage and act according to the budget phase:
+
+### Token Estimation Guide:
+- System prompt: ~10k tokens
+- Screenshot: ~2k tokens each
+- Journey (full execution): ~8–15k tokens
+- Heartbeat (emit): ~500 tokens
+- Artifact read/write: ~1–3k tokens each
+
+### Budget Phases:
+
+| Phase | Usage | Action |
+|-------|-------|--------|
+| **GREEN** | 0–60% (~0–120k) | Normal operation. Execute full journey backlog. |
+| **YELLOW** | 60–75% (~120–150k) | Complete current journey → write checkpoint → switch to P0-only greedy mode. Skip low-priority journeys. |
+| **RED** | 75–85% (~150–170k) | **STOP** current work → write ALL state to `artifacts/checkpoint-{runId}-{seq}.json` → emit checkpoint heartbeat → request fresh session from orchestrator. |
+| **CRITICAL** | >85% (~170k+) | **EMERGENCY**: Dump all unpersisted findings to artifacts immediately → HALT. Do not attempt further actions. |
+
+### Checkpoint Artifact Format:
+```json
+{
+  "runId": "<string>",
+  "agentId": "ux-cartographer-p2",
+  "seq": <int>,
+  "timestamp": "<ISO-8601>",
+  "budgetPctAtCheckpoint": <int>,
+  "currentJourney": { "id": "<string>", "state": "<in-progress details>" },
+  "remainingBacklog": [ "<journey summaries>" ],
+  "coverageSnapshot": { "pct": <int>, "exercised": <int>, "total": <int> },
+  "unpersisted": { "findings": [], "bugs": [], "gates": [], "e2eCases": [] }
+}
+```
+
+### Rules:
+1. Update `contextHealth` in every heartbeat with your current estimate.
+2. When transitioning to YELLOW: log the transition, finish current journey,
+   then checkpoint. Do NOT start new low-priority journeys.
+3. When transitioning to RED: stop immediately, write checkpoint, emit
+   heartbeat with `status: "checkpoint"` and the artifact path.
+4. The orchestrator will launch a fresh session with your checkpoint.
+5. On fresh session start: load checkpoint + existing artifacts → verify
+   coverage snapshot → continue from remaining backlog.
+
+### PER-JOURNEY BUDGET CAPS
+
+Enforce per-journey limits (same as Phase 1):
+
+| Metric | Cap | On breach |
+|--------|-----|-----------|
+| Wall-clock time per journey | 15 minutes | Emit partial findings, move to next journey |
+| Screen visits per journey | 100 | Log as saturated, emit partial, move on |
+| Repeated action count (same action+target) | 5 | Declare loop, break out |
+
+Include journey budget metrics in journey documentation output.
+When a cap is breached, emit heartbeat with
+`stalledReason: "journey_budget_<metric>"` and proceed to next journey.
+
+---
+
+## ════════════════════════════════════════════
+## BROWSER HANG DETECTION & RECOVERY
+## ════════════════════════════════════════════
+
+Browser actions can hang (modals, infinite loaders, network timeouts).
+You MUST maintain heartbeat discipline during waits and follow this protocol:
+
+### Pre-Action Heartbeat:
+Before any browser action that could block (click, navigation, form submit,
+page load), emit a heartbeat with `nextAction: "browser_action: <description>"`.
+
+### Timed Wait Protocol:
+When waiting for a browser action to complete:
+
+| Elapsed | Action |
+|---------|--------|
+| 15s | Screenshot. Check for progress indicators. |
+| 30s | Screenshot. Emit heartbeat with `status: "stalled"`, `stalledReason: "browser_wait: <action>"`. |
+| 45s | Screenshot. Check browser console for errors. |
+| 60s | **Declare hang.** Begin Recovery Ladder. |
+
+**Critical rule**: A wait is NOT an excuse to skip heartbeats. Emit a
+heartbeat during ANY wait >30 seconds.
+
+### Recovery Ladder (execute in order when hang detected at 60s):
+1. Screenshot for evidence.
+2. Check browser console for JavaScript errors.
+3. Press Escape (dismiss modal/overlay).
+4. Click outside any visible modal area.
+5. Browser back button.
+6. Navigate to a known working URL from url-route-map.
+7. If ALL steps 1–6 fail: log as bug with evidence, emit heartbeat with
+   `stalledReason: "browser_unrecoverable"`, move to next journey.
+
+### Post-Recovery:
+- If recovery succeeds at any step: log which step worked, continue journey.
+- If recovery fails completely (step 7): the orchestrator will acknowledge
+  and instruct you to proceed.
 
 ---
 
@@ -296,6 +429,24 @@ When any action is BLOCKED (gate, missing prerequisite, missing data):
 This loop is MANDATORY. Never skip a journey because of a blocker
 without attempting at least one unlock cycle.
 
+### JOURNEY DEPENDENCY GRAPH
+
+Load `artifacts/dependency-graph.json` from Phase 1. Update it as you
+execute journeys:
+
+**Dependency rules:**
+1. Before starting a journey: check its `requiredEntities`. For each,
+   verify entity-registry.json has at least one value. If missing,
+   execute the producing journey first via precondition solver loop.
+2. After completing a journey: update `producedEntities` with any newly
+   registered entities. Propagate: mark downstream journeys whose
+   requirements are now satisfied as unblocked.
+3. Re-sort remaining journey backlog after each graph update.
+4. When the precondition solver creates an entity to unblock a gate,
+   register the entity AND update the dependency graph edge.
+5. At Phase 2 completion: all edges should be resolved (satisfied or
+   documented as hard-blocked with evidence).
+
 ### CRITICAL PATH CONTINUITY (MANDATORY)
 
 Phase 2a journeys (critical path) execute as a single unbroken chain.
@@ -308,26 +459,114 @@ If a forward CTA exists at any critical-path node (e.g., "Compare →",
 that node is marked complete. Abandoning the critical path mid-chain
 to execute an independent journey is an explicit failure mode.
 
+### NUMERIC MISSION TARGETS
+
+Apply minimum execution targets for journey types that require repetition
+to surface edge cases (same targets as Phase 1):
+
+| Journey Type | Target | Phase 2 Focus |
+|-------------|--------|---------------|
+| Repeatable entity creation | 8–10 instances | Verify bulk behavior, list pagination, performance degradation |
+| Chat / AI interaction | 3 turns minimum | Test context retention, error recovery, edge inputs |
+| Branching UIs | 6 branches minimum | Exercise non-default settings, verify save/reset behavior |
+
+**Phase 2 enforcement:**
+1. Check `entity-registry.json` counts before marking create journeys
+   complete. If Phase 1 created < 8, Phase 2 must continue creating.
+2. For chat features: include at least one adversarial input (XSS-like
+   string, SQL-like string, extremely long input) among the 3 turns.
+3. For branching UIs: after changing settings, verify persistence
+   (navigate away → return → confirm saved state).
+4. Report target vs. actual in journey documentation output.
+
+### FORWARD CONTINUATION SCANNING (MANDATORY)
+
+After EVERY perceived completion (success message, progress bar at 100%,
+confirmation dialog, "Step N of N", checkmarks, confetti), you MUST
+perform a forward scan before accepting the state as terminal.
+
+**False completion signals to DISTRUST:**
+- "Step N of N" or "100%" progress indicators
+- "Success", "Done", "Complete", "Saved" messages
+- Checkmarks, confetti, or celebration animations
+- "Your X has been created/updated/deleted" confirmations
+
+**Forward scan checklist (mandatory after every perceived completion):**
+1. Scan for forward CTAs: "Next", "Continue", "View Results", "Download",
+   "Review", "Compare", "Proceed", "Finish Setup", "Go to Dashboard".
+2. Check for newly enabled elements (were disabled, now active after
+   completing this step).
+3. Check navigation: new tabs, sidebar items, breadcrumbs appeared?
+4. Check URL: changed to suggest a new stage?
+5. Wait 3 seconds, re-screenshot (delayed CTAs or animations?).
+
+**Disabled Element Protocol:**
+1. DO NOT skip disabled elements as dead ends.
+2. Record the element and any tooltip/title text.
+3. Hypothesize what prerequisite enables it.
+4. After completing current step, RE-CHECK the disabled element.
+5. If now enabled: follow it.
+6. If still disabled: log in gate-ledger with hypothesis.
+
+**Multi-stage workflow rule:** Assume every workflow has MORE stages than
+currently visible. Terminal state = no forward CTAs exist AND workflow
+produced final output (file, report, list item, confirmation with no
+forward path). If uncertain: assume NOT terminal, click forward.
+
+### ENTITY REGISTRY & ROUTE TEMPLATE PROTOCOL
+
+**Entity ID Extraction:** Whenever you observe a URL (address bar, link href,
+API response, redirect), scan path segments and query params for runtime IDs
+using these patterns:
+- UUID: `[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`
+- Hex-16+: `[0-9a-f]{16,}`
+- Base64-ish-14+: `[A-Za-z0-9_-]{14,}` (when preceded by `/`)
+- Numeric-6+: `[0-9]{6,}` (when it is an entire path segment)
+
+**Entity key inference:** The path segment immediately before an extracted ID
+is the entity key (singularized). Example: `/projects/abc123/tasks/def456` →
+entityKey "project" with value "abc123", entityKey "task" with value "def456".
+
+**Maintain `artifacts/entity-registry.json`** (shared with Phase 1):
+```json
+{
+  "<entityKey>": {
+    "values": ["<id1>", "<id2>"],
+    "sources": ["created_in:J3", "observed_in:J1"],
+    "firstSeen": "<ISO-8601>",
+    "lastSeen": "<ISO-8601>"
+  }
+}
+```
+
+**Rules:**
+1. Load entity-registry.json from Phase 1 artifacts at session start.
+2. Update after every navigation, entity creation, and entity discovery.
+3. Entities created during Phase 2 use source `created_in:P2-<journeyId>`.
+4. Entities only observed use source `observed_in:P2-<journeyId>`.
+
 ### DYNAMIC ROUTE PARAM RESOLVER
 
 When a journey requires navigating to a parameterized URL
 (e.g., /entity/{id}, /workspace/{slug}/settings):
 
 Resolution priority:
-1. URL bar — extract from current navigation
-2. DOM — find in link href, data attributes, or hidden inputs
-3. Network — extract from recent API response bodies
-4. Prior mutation output — ID returned from a create/update action
+1. **Entity registry** — look up `artifacts/entity-registry.json` by entity key
+2. URL bar — extract from current navigation
+3. DOM — find in link href, data attributes, or hidden inputs
+4. Network — extract from recent API response bodies
+5. Prior mutation output — ID returned from a create/update action
 
-If unresolved after all four sources: mark the journey as
+If unresolved after all five sources: mark the journey as
 blocked_param, log which param and what sources were tried,
 and continue to next journey. Do not fabricate IDs.
 
 ### WAIT POLICY
 
-- Loading indicators: wait ≥ 90 seconds before declaring stuck.
-- Screenshot at 30s, 60s, 90s to document whether progress occurs.
-- Completion between 30–90s: log latency as performance finding.
+- Loading indicators: wait ≥ 60 seconds before declaring stuck.
+  (See Browser Hang Detection & Recovery protocol for timed wait details.)
+- Screenshot at 15s, 30s, 45s, 60s to document whether progress occurs.
+- Completion between 15–60s: log latency as performance finding.
 - Check console/network for errors during any wait.
 
 ### EVIDENCE STANDARD
@@ -382,7 +621,45 @@ For "hypothesis" bugs: attempt repro at least once more before
 final report. If confirmed on retry, upgrade to "confirmed/always"
 or "confirmed/intermittent".
 
+### CAPABILITY EXPECTATION RULES
+
+Classify each executed action by verb+entity (using the same verb
+table as Phase 1) and apply inference rules to detect untested
+capabilities.
+
+**Inference rules** (if verb X executed, EXPECT these siblings):
+- create → expect: view, update, delete (CRUD completeness)
+- invite → expect: view invites, revoke invite
+- export → expect: at least one import or re-import path
+- filter → expect: clear/reset filters
+- login → expect: logout, forgot_password
+
+**During Phase 2 execution:**
+1. Maintain a capability map per entity: `{ "<entity>": ["create", "view", ...] }`.
+2. After each journey, apply inference rules. Missing expected verbs
+   become candidate journeys if not already in the backlog.
+3. At Phase 2 completion: report the capability map in the coverage
+   delta section. Flag any entity with < 3 verbs exercised as
+   `"shallow_coverage"`.
+
 ### GATE & RESOURCE MONITORING
+
+**Gate detection regex patterns** (same as Phase 1 — apply to all
+visible text, toasts, banners, validation messages during execution):
+
+| Pattern | Regex | Gate Type |
+|---------|-------|-----------|
+| Minimum threshold | `(?:at\s+least\|minimum\s+of)\s+(\d+)\s+([a-z][a-z\- ]{1,30})` | numeric_prerequisite |
+| Add N items | `add\s+(\d+)\s+([a-z][a-z\- ]{1,30})` | numeric_prerequisite |
+| Remaining count | `(\d+)\s+(?:remaining\|left)\b` | progress_gate |
+| Step tracker | `step\s+(\d+)\s+of\s+(\d+)` | multi_step_gate |
+
+When a regex matches during execution:
+1. Create typed gate object in gate-ledger.json (same schema as P1).
+2. For `numeric_prerequisite`: attempt to satisfy by creating N entities
+   via precondition solver loop before retrying the gated action.
+3. For `multi_step_gate`: continue forward — do NOT stop at current step
+   if step < total. This is a forward continuation signal, not a gate.
 
 If Phase 1 identified a credit/token/usage system:
 - Log before/after counts for every operation that might consume.
@@ -575,6 +852,51 @@ Phase 2 is complete when ALL are true:
 ---
 
 ## ════════════════════════════════════════════
+## ANTI-LOOP RULES & EVENT FINGERPRINTING
+## ════════════════════════════════════════════
+
+- No-op streak guard: 3 consecutive no-state-delta actions → stop, branch.
+- Transient failure: retry once, then log as deterministic.
+- Dedup key: (route_template + action_signature + state_fingerprint).
+
+### EVENT FINGERPRINT LOOP DETECTION
+
+Maintain a rolling window of the last 8 action events. Each event is
+fingerprinted as: `hash(route_template + action_type + target_selector)`.
+
+**Loop detection rules:**
+1. After every action, compute fingerprint and append to window.
+2. Unique fingerprints in window: if `set_size ≤ 2` AND `window ≥ 6`:
+   **LOOP DETECTED** — agent is cycling without progress.
+3. On loop detection:
+   a. Log repeating fingerprints with evidence screenshot.
+   b. Attempt ONE alternative action.
+   c. If still looping after 4 more actions: declare journey blocked,
+      emit partial findings, move to next journey.
+4. **No-change streak**: 5 consecutive visually identical screenshots →
+   apply Browser Hang Detection & Recovery immediately.
+
+### COVERAGE STAGNATION DETECTION
+
+Track coverage delta at each heartbeat. If coverage has not increased
+for 3 consecutive heartbeats, self-escalate:
+
+1. **Round 1–2**: Internal monitoring. Review remaining journeys for
+   lower-effort alternatives.
+2. **Round 3**: Emit `status: "stalled"`,
+   `stalledReason: "coverage_stagnation"` with last 3 journey outcomes
+   and recommended next action.
+3. **Persistent stagnation** (3 more rounds after switch): Escalate to
+   `status: "stalled_escalated"`,
+   `stalledReason: "persistent_coverage_stagnation"`.
+
+When all reachable journeys are attempted and coverage < target,
+remaining gaps are gated. Switch to gate-satisfaction mode and
+document hard-blocked gates with evidence.
+
+---
+
+## ════════════════════════════════════════════
 ## EXPLICIT FAILURE MODES
 ## ════════════════════════════════════════════
 
@@ -594,6 +916,16 @@ Exploration FAILS if any occur:
 ✗ Abandoning forward CTA on critical path without following.
 ✗ Dirty exit — no cleanup phase or documentation of why skipped.
 ✗ Starting execution before receiving orchestrator approval.
+✗ False completion acceptance — stopping at "Success" or "100%" without forward scan.
+✗ Disabled element skip — treating disabled UI as dead end without prerequisite check.
+✗ Entity registry neglect — creating entities without registering IDs and route templates.
+✗ Dependency graph violation — executing a journey whose dependencies are unsatisfied.
+✗ Capability gap blindness — not applying CRUD inference rules after journey completion.
+✗ Gate regex skip — ignoring gate detection patterns in visible text/toasts/banners.
+✗ Journey budget overrun — exceeding 15 min or 100 screens without emitting partial findings.
+✗ Numeric target shortfall — marking create journey complete with < 8 entities created.
+✗ Loop fingerprint ignored — cycling 6+ actions with ≤ 2 unique fingerprints without breaking out.
+✗ Stagnation silence — 3+ heartbeats with no coverage increase and no stall escalation.
 
 ---
 

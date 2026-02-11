@@ -62,6 +62,38 @@
       groupChat: {
         mentionPatterns: ["@mapper-p2", "@cartographer-p2", "mapper jack phase 2"]
       }
+    },
+
+    // ─── Orchestrator: Lifecycle Coordinator ─────────────────────────
+    {
+      id: "ux-orchestrator",
+      workspace: "~/.openclaw/ws-orchestrator",
+
+      identity: {
+        name: "Dispatch",
+        theme: "orchestration, monitoring, lifecycle management",
+        emoji: "📡"
+      },
+
+      model: {
+        primary: "anthropic/claude-sonnet-4-5-20250929",
+        fallbacks: ["anthropic/claude-haiku-4-5-20251001"]
+      },
+
+      sandbox: {
+        mode: "all",
+        workspaceAccess: "rw"
+      },
+
+      tools: {
+        profile: "full"
+      },
+
+      systemPrompt: { "$include": "../prompts/orchestrator-system.md" },
+
+      groupChat: {
+        mentionPatterns: ["@dispatch", "@orchestrator", "dispatch"]
+      }
     }
   ],
 
@@ -71,10 +103,11 @@
     }
   },
 
-  // Orchestrator routes to specific agent by mention pattern.
-  // Default catch-all goes to Phase 1 (typical entry point).
+  // Orchestrator is the default entry point (catch-all).
+  // Agents are routed by mention pattern.
   bindings: [
     { agentId: "ux-cartographer-p2", match: { peer: "@mapper-p2" } },
-    { agentId: "ux-cartographer-p1", match: {} }
+    { agentId: "ux-cartographer-p1", match: { peer: "@mapper-p1" } },
+    { agentId: "ux-orchestrator", match: {} }
   ]
 }
